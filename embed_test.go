@@ -21,7 +21,7 @@ func startRiver(t *testing.T, pool *pgxpool.Pool, ed *eddy.Embedded) *river.Clie
 	workers := river.NewWorkers()
 	ed.AddWorkers(workers)
 	client, err := river.NewClient(riverpgxv5.New(pool), &river.Config{
-		Queues:       map[string]river.QueueConfig{ed.Queue(): ed.QueueConfig()},
+		Queues:       ed.Queues(),
 		Workers:      workers,
 		PeriodicJobs: ed.PeriodicJobs(),
 	})

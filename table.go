@@ -45,20 +45,26 @@ type Table[T any] struct {
 	cols    []column
 	key     column
 	keyType reflect.Type
+	set     settings
 }
 
 // TableOption configures NewTable.
-type TableOption func(*tableOptions)
+type TableOption interface{ applyTable(*tableOptions) }
 
 type tableOptions struct {
 	key, kind string
+	set       settings
 }
 
+type tableOption func(*tableOptions)
+
+func (f tableOption) applyTable(o *tableOptions) { f(o) }
+
 // Key names the key column; the default is "id".
-func Key(column string) TableOption { return func(o *tableOptions) { o.key = column } }
+func Key(column string) TableOption { return tableOption(func(o *tableOptions) { o.key = column }) }
 
 // KindName sets the kind name used in jobs; the default is the table name.
-func KindName(name string) TableOption { return func(o *tableOptions) { o.kind = name } }
+func KindName(name string) TableOption { return tableOption(func(o *tableOptions) { o.kind = name }) }
 
 // NewTable returns the Table for struct T stored in the table called name
 // (optionally schema-qualified). It panics when T cannot be mapped: these
@@ -66,7 +72,7 @@ func KindName(name string) TableOption { return func(o *tableOptions) { o.kind =
 func NewTable[T any](name string, opts ...TableOption) *Table[T] {
 	o := tableOptions{key: "id", kind: name}
 	for _, opt := range opts {
-		opt(&o)
+		opt.applyTable(&o)
 	}
 	fail := func(format string, args ...any) {
 		panic(fmt.Sprintf("eddy: NewTable(%q): ", name) + fmt.Sprintf(format, args...))
@@ -79,7 +85,7 @@ func NewTable[T any](name string, opts ...TableOption) *Table[T] {
 	if err != nil {
 		fail("%v", err)
 	}
-	t := &Table[T]{name: name, kind: o.kind, cols: cols}
+	t := &Table[T]{name: name, kind: o.kind, cols: cols, set: o.set}
 	for _, c := range cols {
 		ft := typ.FieldByIndex(c.index).Type
 		if c.name == o.key {
@@ -116,7 +122,7 @@ func (t *Table[T]) Of(id any) Ref {
 	if err != nil {
 		panic(err.Error())
 	}
-	return Ref{kind: t.kind, id: raw}
+	return Ref{kind: t.kind, id: raw, set: t.set}
 }
 
 func (t *Table[T]) encodeKey(id any) (json.RawMessage, error) {
@@ -265,7 +271,7 @@ func (t *Table[T]) job(v reflect.Value, gone bool) (reconcileJob, error) {
 	if err != nil {
 		return reconcileJob{}, fmt.Errorf("eddy: %s: encode key: %w", t.name, err)
 	}
-	job := reconcileJob{Object: t.kind, ID: id}
+	job := reconcileJob{Object: t.kind, ID: id, set: t.set}
 	if gone {
 		fields := make(map[string]json.RawMessage, len(t.cols))
 		for _, c := range t.cols {
@@ -447,6 +453,7 @@ func Reconcile[T any](t *Table[T], f func(ctx context.Context, row *T) error) Op
 			return errors.New("eddy: Reconcile: nil table or func")
 		}
 		reg := c.table(t.kind)
+		c.settings[t.kind] = t.set
 		if reg.reconcile != nil {
 			return fmt.Errorf("eddy: Reconcile(%s): registered twice", t.kind)
 		}
@@ -506,6 +513,7 @@ func Teardown[T any](t *Table[T], f func(ctx context.Context, row *T) error) Opt
 			return errors.New("eddy: Teardown: nil table or func")
 		}
 		reg := c.table(t.kind)
+		c.settings[t.kind] = t.set
 		if reg.teardown != nil {
 			return fmt.Errorf("eddy: Teardown(%s): registered twice", t.kind)
 		}

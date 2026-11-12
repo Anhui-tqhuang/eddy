@@ -81,6 +81,7 @@ type config struct {
 	resyncs      map[string]resync  // bare kinds
 	tables       map[string]*tableReg
 	recorders    map[string]recorder
+	settings     map[string]settings // per kind, from its declaration
 	middleware   []Middleware
 	onLeadership []func(bool)
 }
@@ -96,6 +97,7 @@ func newConfig(opts []Option) (*config, error) {
 		resyncs:         map[string]resync{},
 		tables:          map[string]*tableReg{},
 		recorders:       map[string]recorder{},
+		settings:        map[string]settings{},
 	}
 	if err := c.apply(opts); err != nil {
 		return nil, err
@@ -119,6 +121,7 @@ func (c *config) apply(opts []Option) error {
 func (c *config) with(opts []Option) (*config, error) {
 	cp := *c
 	cp.handlers, cp.resyncs, cp.recorders = maps.Clone(c.handlers), maps.Clone(c.resyncs), maps.Clone(c.recorders)
+	cp.settings = maps.Clone(c.settings)
 	cp.tables = make(map[string]*tableReg, len(c.tables))
 	for name, reg := range c.tables {
 		r := *reg
@@ -188,6 +191,7 @@ func Handle[ID any](k Kind[ID], f func(ctx context.Context, id ID) error) Option
 		if _, dup := c.handlers[k.name]; dup {
 			return fmt.Errorf("eddy: Handle(%s): kind registered twice", k.name)
 		}
+		c.settings[k.name] = k.set
 		c.handlers[k.name] = func(ctx context.Context, _ *pgxpool.Pool, job reconcileJob) error {
 			var id ID
 			if err := json.Unmarshal(job.ID, &id); err != nil {
@@ -260,7 +264,9 @@ func WithoutMigrate() Option {
 	}
 }
 
-// WithWorkers sets how many reconciles run at once. The default is 10.
+// WithWorkers sets how many reconciles run at once on the shared queue. The
+// default is 10. Kinds declared with MaxWorkers run on top of that, each in
+// its own queue.
 func WithWorkers(n int) Option {
 	return func(c *config) error {
 		if n < 1 {

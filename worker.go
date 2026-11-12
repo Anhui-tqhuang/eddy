@@ -136,10 +136,8 @@ func (w *resyncWorker) Work(ctx context.Context, job *river.Job[resyncJob]) erro
 		batch := ids[start:min(start+insertBatch, len(ids))]
 		params := make([]river.InsertManyParams, len(batch))
 		for i, id := range batch {
-			params[i] = river.InsertManyParams{
-				Args:       reconcileJob{Object: kind, ID: id},
-				InsertOpts: &river.InsertOpts{Queue: w.rt.cfg.queue},
-			}
+			j := reconcileJob{Object: kind, ID: id, set: w.rt.cfg.settings[kind]}
+			params[i] = river.InsertManyParams{Args: j, InsertOpts: j.insertOpts(w.rt.cfg.queue)}
 		}
 		if _, err := client.InsertMany(ctx, params); err != nil {
 			return fmt.Errorf("resync %s: enqueue: %w", kind, err)
@@ -153,6 +151,18 @@ func (w *resyncWorker) Work(ctx context.Context, job *river.Job[resyncJob]) erro
 func (rt *runtime) addWorkers(ws *river.Workers) {
 	river.AddWorker(ws, &reconcileWorker{rt: rt})
 	river.AddWorker(ws, &resyncWorker{rt: rt})
+}
+
+// queues returns the shared queue plus one per kind declared with
+// MaxWorkers.
+func (rt *runtime) queues() map[string]river.QueueConfig {
+	qs := map[string]river.QueueConfig{rt.cfg.queue: {MaxWorkers: rt.cfg.workers}}
+	for kind := range rt.handlers {
+		if set := rt.cfg.settings[kind]; set.workers > 0 {
+			qs[queueFor(rt.cfg.queue, kind, set)] = river.QueueConfig{MaxWorkers: set.workers}
+		}
+	}
+	return qs
 }
 
 // periodicJobs returns one resync job per resynced kind.

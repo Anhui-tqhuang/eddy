@@ -17,15 +17,17 @@ import (
 //	workers := river.NewWorkers()
 //	ed.AddWorkers(workers)
 //	// ... your own workers ...
+//	queues := ed.Queues()
+//	queues[river.QueueDefault] = river.QueueConfig{MaxWorkers: 50}
 //	client, _ := river.NewClient(riverpgxv5.New(pool), &river.Config{
-//		Queues:       map[string]river.QueueConfig{river.QueueDefault: {MaxWorkers: 50}, ed.Queue(): ed.QueueConfig()},
+//		Queues:       queues,
 //		Workers:      workers,
 //		PeriodicJobs: ed.PeriodicJobs(),
 //	})
 //	db := ed.DB(client)
 //
-// There is no eddy leader election here: every process that lists the eddy
-// queue works it. Reconciles of one object are serialised within a process;
+// There is no eddy leader election here: every process that lists eddy's
+// queues works them. Reconciles of one object are serialised within a process;
 // add WithObjectLocks to serialise them across processes too. Resync jobs
 // run on River's own elected leader.
 type Embedded struct {
@@ -53,13 +55,10 @@ func Embed(pool *pgxpool.Pool, opts ...Option) (*Embedded, error) {
 // AddWorkers registers eddy's workers on ws.
 func (e *Embedded) AddWorkers(ws *river.Workers) { e.rt.addWorkers(ws) }
 
-// Queue is the queue eddy's jobs go to; list it in your client's Queues.
-func (e *Embedded) Queue() string { return e.rt.cfg.queue }
-
-// QueueConfig sizes the eddy queue from WithWorkers.
-func (e *Embedded) QueueConfig() river.QueueConfig {
-	return river.QueueConfig{MaxWorkers: e.rt.cfg.workers}
-}
+// Queues are eddy's queues and their sizes: the shared one, sized by
+// WithWorkers, plus one per kind declared with MaxWorkers. Add them all to
+// your client's Queues.
+func (e *Embedded) Queues() map[string]river.QueueConfig { return e.rt.queues() }
 
 // PeriodicJobs are the resync jobs; add them to your client's PeriodicJobs.
 func (e *Embedded) PeriodicJobs() []*river.PeriodicJob { return e.rt.periodicJobs() }

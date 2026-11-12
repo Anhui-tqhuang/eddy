@@ -64,7 +64,7 @@ func (db *DB) lead(lead context.Context, rt *runtime) error {
 	// A fresh River client per leadership term.
 	rc, err := river.NewClient(riverpgxv5.New(db.pool), &river.Config{
 		Logger:       cfg.logger,
-		Queues:       map[string]river.QueueConfig{cfg.queue: {MaxWorkers: cfg.workers}},
+		Queues:       rt.queues(),
 		Workers:      workers,
 		PeriodicJobs: rt.periodicJobs(),
 	})

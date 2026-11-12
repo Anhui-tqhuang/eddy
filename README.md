@@ -166,34 +166,69 @@ db.Run(ctx,
 
 `Record` runs after every attempt with an `Outcome` (error, attempt number, duration, whether a retry follows). `ColumnStatus` writes the usual columns; pass your own function for anything else.
 
-## Metrics and tracing
+## Scheduling
 
-Middleware wraps every reconcile and teardown. eddy itself depends on neither OpenTelemetry nor Prometheus:
+Declare how a kind is scheduled where you declare the table or kind, so the API and the controller agree:
 
 ```go
-func tracing(next eddy.Handler) eddy.Handler {
-    return func(ctx context.Context, ref eddy.Ref) error {
-        ctx, span := tracer.Start(ctx, "reconcile "+ref.Kind(), trace.WithAttributes(
-            attribute.String("eddy.id", ref.ID()),
-            attribute.Int("eddy.attempt", eddy.Attempt(ctx)),
-            attribute.Bool("eddy.teardown", ref.Deleted()),
-        ))
-        defer span.End()
-        err := next(ctx, ref)
-        if _, retry := eddy.RetryDelay(err); err != nil && !retry {
-            span.RecordError(err)
-        }
-        return err
-    }
-}
-
-db.Run(ctx, ...,
-    eddy.WithMiddleware(tracing, metrics), // first is outermost
-    eddy.OnLeadershipChange(func(leading bool) { isLeader.Store(leading) }),
+var Reports = eddy.NewTable[Report]("reports",
+    eddy.MaxWorkers(2),   // at most 2 report reconciles at once
+    eddy.Priority(3),     // 1 (default) is most urgent, 4 least
 )
 ```
 
-`db.Leading()` reports leadership, for a readiness probe.
+- **`MaxWorkers(n)`** gives the kind a queue of its own with `n` workers, on top of the shared pool sized by `WithWorkers`. A slow kind can't crowd out the others, and the others can't starve it.
+- **`Priority(n)`** orders kinds that share a queue. Lower-priority reconciles are picked up only when nothing more urgent is waiting.
+
+Both also work on `eddy.NewKind`.
+
+## Metrics and tracing
+
+Ready-made instrumentation lives in two small modules, so the core depends on neither OpenTelemetry nor Prometheus.
+
+**OpenTelemetry** (`go get github.com/Anhui-tqhuang/eddy/eddyotel`): a span and a duration measurement per reconcile.
+
+```go
+db.Run(ctx, ...,
+    eddy.WithMiddleware(eddyotel.Middleware()),   // uses the global providers by default
+)
+```
+
+Spans are named `eddy.reconcile <kind>` or `eddy.teardown <kind>` and carry `eddy.kind`, `eddy.id`, `eddy.attempt` and `eddy.outcome`. The histogram is `eddy.reconcile.duration`, in seconds. Spans the reconciler starts become children.
+
+**Prometheus** (`go get github.com/Anhui-tqhuang/eddy/eddyprom`):
+
+```go
+m, _ := eddyprom.New(prometheus.DefaultRegisterer)
+
+db.Run(ctx, ...,
+    eddy.WithMiddleware(m.Middleware()),
+    eddy.OnLeadershipChange(m.SetLeading),
+)
+```
+
+| Metric | Labels | |
+|---|---|---|
+| `eddy_reconcile_duration_seconds` | `kind`, `operation`, `outcome` | Histogram of reconcile and teardown durations |
+| `eddy_reconciles_in_flight` | `kind` | Reconciles running now |
+| `eddy_leader` | — | 1 while this replica leads |
+
+In both, the outcome is `ok`, `retry` (asked to be checked again later), `error` (will be retried) or `permanent`.
+
+**Your own middleware** wraps every reconcile and teardown the same way:
+
+```go
+func logging(next eddy.Handler) eddy.Handler {
+    return func(ctx context.Context, ref eddy.Ref) error {
+        err := next(ctx, ref)
+        slog.InfoContext(ctx, "reconciled", "kind", ref.Kind(), "id", ref.ID(),
+            "attempt", eddy.Attempt(ctx), "teardown", ref.Deleted(), "error", err)
+        return err
+    }
+}
+```
+
+The first middleware given is the outermost. `db.Leading()` reports leadership, for a readiness probe.
 
 ## Already running River?
 
@@ -206,11 +241,11 @@ workers := river.NewWorkers()
 ed.AddWorkers(workers)
 river.AddWorker(workers, &YourOtherWorker{})
 
+queues := ed.Queues()              // eddy's queues and their sizes
+queues[river.QueueDefault] = river.QueueConfig{MaxWorkers: 50}
+
 client, _ := river.NewClient(riverpgxv5.New(pool), &river.Config{
-    Queues: map[string]river.QueueConfig{
-        river.QueueDefault: {MaxWorkers: 50},
-        ed.Queue():         ed.QueueConfig(),
-    },
+    Queues:       queues,
     Workers:      workers,
     PeriodicJobs: ed.PeriodicJobs(),
 })
@@ -218,7 +253,7 @@ client, _ := river.NewClient(riverpgxv5.New(pool), &river.Config{
 db := ed.DB(client)                // the same eddy.DB, enqueueing through your client
 ```
 
-An API-only process uses `eddy.Attach(pool, client)` to get the `DB`. eddy doesn't elect a leader in this mode: every process whose client lists `ed.Queue()` works it. List the queue on one process only, or add `WithObjectLocks()` so processes never overlap on a row. Resync jobs run on River's own elected leader, and you run River's migrations.
+An API-only process uses `eddy.Attach(pool, client)` to get the `DB`. eddy doesn't elect a leader in this mode: every process whose client lists `ed.Queues()` works them. List them on one process only, or add `WithObjectLocks()` so processes never overlap on a row. Resync jobs run on River's own elected leader, and you run River's migrations.
 
 ## Options
 
@@ -230,7 +265,7 @@ An API-only process uses `eddy.Attach(pool, client)` to get the `DB`. eddy doesn
 | `Handle(kind, f)` | — | Reconcile a bare kind |
 | `Resync(kind, every, list)` | off | Periodically enqueue the listed objects of a bare kind |
 | `Record(kind, f)` | off | Record each attempt of a bare kind (see `ColumnStatus`) |
-| `WithWorkers(n)` | 10 | Concurrent reconciles on the leader |
+| `WithWorkers(n)` | 10 | Concurrent reconciles on the shared queue; kinds with `MaxWorkers` run on top |
 | `WithElector(e)` | advisory lock | Leader election; `Solo()` for a single replica |
 | `WithObjectLocks()` | off | Per-object advisory lock across processes; holds one pool connection per running reconcile |
 | `WithReconcileTimeout(d)` | 1m | Bound on one reconcile |
@@ -250,11 +285,6 @@ make test      # unit tests
 make test-db   # plus integration tests against Postgres
                # (TEST_DB_URL=postgres://localhost:5432/eddy_test?sslmode=disable)
 ```
-
-## Roadmap
-
-- Ready-made OpenTelemetry and Prometheus middleware, as separate modules so the core stays dependency-light
-- Per-kind worker limits and priorities
 
 ## License
 

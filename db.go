@@ -145,7 +145,7 @@ func (db *DB) insert(ctx context.Context, tx pgx.Tx, jobs []reconcileJob) error 
 		batch := jobs[start:min(start+insertBatch, len(jobs))]
 		params := make([]river.InsertManyParams, len(batch))
 		for i, j := range batch {
-			params[i] = river.InsertManyParams{Args: j, InsertOpts: &river.InsertOpts{Queue: db.cfg.queue}}
+			params[i] = river.InsertManyParams{Args: j, InsertOpts: j.insertOpts(db.cfg.queue)}
 		}
 		var err error
 		if tx != nil {
@@ -166,7 +166,7 @@ func jobsFor(refs []Ref) ([]reconcileJob, error) {
 		if !r.valid() {
 			return nil, errors.New("eddy: enqueue: invalid Ref (build one with Kind.Of or Table.Of)")
 		}
-		jobs[i] = reconcileJob{Object: r.kind, ID: r.id}
+		jobs[i] = reconcileJob{Object: r.kind, ID: r.id, set: r.set}
 	}
 	return jobs, nil
 }

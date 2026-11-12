@@ -21,7 +21,7 @@ eddy is available for Go and Python. Each has its own usage documentation.
 | Language | Package | Documentation |
 |---|---|---|
 | Go | `github.com/Anhui-tqhuang/eddy` | This README |
-| Python | [`eddy-pg`](https://github.com/Anhui-tqhuang/eddy-python) | [eddy-python README](https://github.com/Anhui-tqhuang/eddy-python#readme) |
+| Python | [`eddy-pg`](https://pypi.org/project/eddy-pg/) on PyPI | [eddy-python README](https://github.com/Anhui-tqhuang/eddy-python#readme) |
 
 The two store jobs in the same format and share the leader lock, so they can be mixed on one database: a Python API can feed a Go controller, or the reverse. The rest of this page covers Go.
 

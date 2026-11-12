@@ -15,12 +15,14 @@ type column struct {
 	index      []int // reflect field path
 	status     bool  // written only by the controller
 	hasDefault bool  // omitted on insert when the field is zero
+	errorMsg   bool  // receives the last reconcile error
+	reconciled bool  // receives the time of the last successful reconcile
 }
 
 // columnsOf maps the exported fields of struct type t to columns. The column
 // name comes from the `db` tag, or the snake_case field name without one.
-// Tag options: "default" and "status"; `db:"-"` skips the field. Embedded
-// structs are flattened.
+// Tag options: "default", "status", "error" and "reconciled"; `db:"-"` skips
+// the field. Embedded structs are flattened.
 func columnsOf(t reflect.Type) ([]column, error) {
 	if t.Kind() != reflect.Struct {
 		return nil, fmt.Errorf("%s is not a struct", t)
@@ -54,6 +56,10 @@ func columnsOf(t reflect.Type) ([]column, error) {
 					c.status = true
 				case "default":
 					c.hasDefault = true
+				case "error":
+					c.status, c.errorMsg = true, true
+				case "reconciled":
+					c.status, c.reconciled = true, true
 				default:
 					return fmt.Errorf("field %s: unknown db tag option %q", f.Name, opt)
 				}

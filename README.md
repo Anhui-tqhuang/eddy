@@ -22,211 +22,185 @@ go get github.com/Anhui-tqhuang/eddy
 
 ## Quick start
 
-Describe the table as a Go struct. Fields tagged `status` belong to the controller; everything else belongs to the API.
+Describe the table as a Go struct, then use one `eddy.DB` on both sides.
 
 ```go
 type App struct {
-    ID        uuid.UUID `db:"id,default"`         // "default": left to the database when zero
-    Name      string    `db:"name"`
-    Image     string    `db:"image"`
-    CreatedAt time.Time `db:"created_at,default"`
-    Phase     string    `db:"phase,status"`       // "status": written only by the controller
-    URL       *string   `db:"url,status"`
+    ID    uuid.UUID `db:",default"`  // filled by the database when zero
+    Name  string
+    Image string
+    Phase string    `db:",status"`   // written only by the controller
 }
 
-var Apps = eddy.NewTable[App, uuid.UUID]("apps")  // struct, key type, table name
+var Apps = eddy.NewTable[App]("apps")
+
+db, _ := eddy.Open(ctx, pool)        // creates eddy's job tables if needed
 ```
 
-**API process:** use `eddy.DB` like a pgx pool. Writes through the table enqueue the reconcile themselves, in the same transaction as the row.
+**API:** write through the table. The reconcile is enqueued for you, in the same transaction as the row.
 
 ```go
-db, _ := eddy.Open(ctx, pool)
-
 app := App{Name: "web", Image: "web:1"}
-Apps.Insert(ctx, db, &app)        // app.ID and app.CreatedAt are filled in
+Apps.Insert(ctx, db, &app)           // app.ID is filled in
 app.Image = "web:2"
-Apps.Update(ctx, db, &app)        // never touches phase or url
+Apps.Update(ctx, db, &app)           // never touches phase
 Apps.Delete(ctx, db, app.ID)
-
-got, err := Apps.Get(ctx, db, id) // eddy.ErrNotFound when missing
-list, _ := Apps.Select(ctx, db, "WHERE name = $1", "web")
-
-db.Query(ctx, "SELECT ...")       // anything else: plain pgx passthrough
 ```
 
-If the write commits, the reconcile is guaranteed to happen. If it rolls back, nothing happens. There is no separate enqueue call, no dual write and no outbox table.
-
-**Controller process:** run one or more replicas. eddy loads the row for you and saves the status fields you assign.
+**Controller:** run it on any number of replicas. One is elected leader and does the work.
 
 ```go
-ctl, _ := eddy.New(ctx, pool,
-    eddy.Reconcile(Apps, reconcileApp),
-    eddy.ResyncAll(Apps, 10*time.Minute),
+db.Run(ctx,
+    eddy.Reconcile(Apps, func(ctx context.Context, app *App) error {
+        if err := deploy(ctx, app); err != nil {
+            return err               // retried with backoff
+        }
+        app.Phase = "ready"          // saved when the function returns
+        return nil
+    }),
+    eddy.Teardown(Apps, func(ctx context.Context, app *App) error {
+        return undeploy(ctx, app)    // app is the row as it was when deleted
+    }),
 )
-ctl.Run(ctx) // blocks; only the elected leader reconciles
-
-func reconcileApp(ctx context.Context, id uuid.UUID, app *App) (eddy.Result, error) {
-    if app == nil {                      // the row is gone
-        return eddy.Done, teardown(ctx, id)
-    }
-    url, err := deploy(ctx, app)
-    if err != nil {
-        app.Phase = "failed"             // saved even though we return an error
-        return eddy.Done, err            // retried with backoff
-    }
-    app.Phase, app.URL = "ready", &url   // saved when we return
-    return eddy.Done, nil
-}
 ```
 
-**Schema:** eddy keeps its jobs in River's tables. Run this from your migration step:
+If a write commits, its reconcile is guaranteed to happen. If it rolls back, nothing happens. There is no enqueue call to remember, no dual write and no outbox table.
+
+## Writing rows
+
+`eddy.DB` is used like a pgx pool, and `*eddy.Tx` has every `pgx.Tx` method.
 
 ```go
-eddy.Migrate(ctx, pool)
+got, err := Apps.Get(ctx, db, id)                          // eddy.ErrNotFound when missing
+list, _ := Apps.Select(ctx, db, "WHERE name = $1", "web")
+db.Query(ctx, "SELECT ...")                                // anything else: plain pgx
 ```
 
-## Working with tables
-
-**Transactions.** Table writes take a `*eddy.DB` (each write is its own transaction) or a `*eddy.Tx` (writes join it). A `Tx` has every `pgx.Tx` method.
+**Transactions.** Table writes take the `DB` (each write is its own transaction) or a `Tx` (writes join it).
 
 ```go
 db.InTx(ctx, func(tx *eddy.Tx) error {
     if err := Teams.Insert(ctx, tx, &team); err != nil {
         return err
     }
-    return Apps.Insert(ctx, tx, &app)   // both rows and both jobs, or none
+    return Apps.Insert(ctx, tx, &app)    // both rows and both jobs, or none
 })
 
-tx := db.WithTx(pgxTx)                  // join a pgx transaction you already hold
+tx := db.WithTx(pgxTx)                   // join a pgx transaction you already hold
 ```
 
-**Raw SQL is not captured.** eddy can't tell which rows an arbitrary statement touched. After a raw write to a reconciled table, enqueue the rows yourself with `tx.Enqueue(ctx, Apps.Of(id))`, or let `ResyncAll` pick them up later.
-
-**Soft delete.** With `eddy.SoftDelete("deleted_at")`, `Delete` stamps the column instead of removing the row, so the reconciler can still read what it has to tear down. `Get` and `Update` treat the row as gone. The reconciler calls `Apps.Purge(ctx, pool, id)` when teardown is complete.
+**Free-form SQL.** `Table.Exec` runs your own INSERT, UPDATE or DELETE and enqueues every row it touched. Use it for bulk changes and anything the typed methods can't express.
 
 ```go
-var Apps = eddy.NewTable[App, uuid.UUID]("apps", eddy.SoftDelete("deleted_at"))
+n, err := Apps.Exec(ctx, db, "UPDATE apps SET image = $1 WHERE team_id = $2", image, teamID)
+```
 
-func reconcileApp(ctx context.Context, id uuid.UUID, app *App) (eddy.Result, error) {
-    if app != nil && app.DeletedAt != nil {
-        if err := teardown(ctx, app); err != nil {
-            return eddy.Done, err
-        }
-        return eddy.Done, Apps.Purge(ctx, pool, id)
-    }
+eddy finds the touched rows by adding a `RETURNING` clause, so the statement must be a single statement without its own `RETURNING` and without a table alias.
+
+**What is not captured.** `db.Exec`, psql and other services write rows without enqueueing anything. Those rows are picked up by the periodic resync, or at once if you call `db.Enqueue(ctx, Apps.Of(id))`.
+
+## Reconciling
+
+- **The row is always fresh.** eddy loads it before each call, so the function sees current state however stale the job is. It must be idempotent.
+- **Status is saved for you.** Whatever the function assigns to `status` fields is written back when it returns, whether it succeeded or failed. `Apps.SaveStatus(ctx, db, app)` saves midway through a long reconcile.
+- **Errors retry.** A returned error retries with backoff. `eddy.Permanent(err)` stops retrying, for a row only a new write can fix. `eddy.Retry(15*time.Second)` checks again later without counting as a failure, for polling something that is still converging.
+- **Deletes carry the row.** `Delete` sends the row's last state with the job, and `Teardown` receives it. You don't need a soft-delete column to know what to tear down. Teardowns retry like reconciles.
+- **Every row is re-checked.** Each table is resynced every 10 minutes by default, and when a replica becomes leader. `eddy.WithResync(d)` changes the interval; zero turns it off.
+- **No overlap per object.** One row is never reconciled twice at once.
+
+eddy can also record how each reconcile went, with two more field tags:
+
+```go
+type App struct {
     ...
+    Error        *string    `db:"reconcile_error,error"`  // last error; cleared on success
+    ReconciledAt *time.Time `db:",reconciled"`            // time of the last success
 }
 ```
 
-**Mapping rules.**
+## Field tags
 
 | Tag | Meaning |
 |---|---|
-| `db:"col"` | Column name. Without a tag, the snake_case field name (`CreatedAt` is `created_at`) |
-| `db:"col,default"` | Omitted from `Insert` when zero, so the database default applies |
-| `db:"col,status"` | Never written by `Insert` or `Update`; saved by the reconciler |
+| `db:"col"` | Column name. Without one, the snake_case field name (`CreatedAt` is `created_at`) |
+| `db:",default"` | Left out of `Insert` when zero, so the database default applies |
+| `db:",status"` | Never written by `Insert` or `Update`; saved after each reconcile |
+| `db:",error"` | A status `string` or `*string` that eddy sets to the last reconcile error |
+| `db:",reconciled"` | A status `time.Time` or `*time.Time` that eddy sets on each success |
 | `db:"-"` | Not a column |
 
-Other table options are `eddy.Key("uid")` for a key column not called `id`, and `eddy.KindName("app")` to name the job kind differently from the table. Embedded structs are flattened. `Apps.SaveStatus(ctx, pool, app)` saves status midway through a long reconcile.
-
-## Without a table
-
-The table layer sits on a smaller core that you can use directly, for objects that aren't one row of one table. Declare a kind, enqueue it yourself, and load whatever you need in the reconciler:
-
-```go
-var Clusters = eddy.NewKind[uuid.UUID]("cluster")   // any JSON-encodable ID
-
-tx, _ := pool.Begin(ctx)
-// ... your own SQL ...
-db.EnqueueTx(ctx, tx, Clusters.Of(clusterID))
-tx.Commit(ctx)
-
-eddy.New(ctx, pool,
-    eddy.HandleFunc(Clusters, func(ctx context.Context, id uuid.UUID) (eddy.Result, error) { ... }),
-    eddy.Resync(Clusters, 10*time.Minute, listClusterIDs),
-)
-```
-
-`eddy.RequeueAfter(d)` as the result reconciles the object again later, for polling something that is still converging.
+The key column is `id` unless you pass `eddy.Key("uid")`. `eddy.KindName("app")` names the job kind differently from the table. Embedded structs are flattened. Fields must survive `encoding/json`, which is how a deleted row reaches `Teardown`.
 
 ## How it works
 
 ```
- Table.Insert/Update/Delete ──tx──▶ your row + river_job ──▶ leader replica ──▶ reconcile(id, row) ──▶ outside world
-                                                              ▲                        │
-                                             Resync every N ──┘      status fields on your row ◀┘
+ Table.Insert/Update/Delete/Exec ──tx──▶ your row + river_job ──▶ leader ──▶ Reconcile(row) ──▶ outside world
+                                                                    ▲             │
+                                                   resync every N ──┘   status fields on your row ◀┘
 ```
 
-- **Jobs carry a pointer, not data.** A job holds only `kind` and `id`. The row is reloaded before every reconcile, so stale or duplicate jobs are harmless.
-- **One leader, elected in Postgres.** Replicas compete for a session-level advisory lock (`pg_try_advisory_lock`). The leader holds one pooled connection, and if that connection drops, the lease is gone. On a clean handoff, the old leader drains its in-flight reconciles before it releases the lock. If its connection drops instead, Postgres frees the lock at once while the old leader is still draining. Add `WithObjectLocks()` to rule out overlap even then. You don't need Kubernetes, etcd or ZooKeeper.
-- **No overlap per object.** One object is never reconciled twice at once within a process, even if it was enqueued many times. `WithObjectLocks()` extends that across processes with a per-object advisory lock.
-- **Errors retry, `Permanent` stops.** A returned error retries with River's backoff. `eddy.Permanent(err)` cancels the job. Use it when only a new write can fix the row.
-- **Resync repairs drift.** `ResyncAll` enqueues every row when a replica becomes leader, then on an interval. It also catches rows changed by raw SQL or other tools.
-- **Typed end to end.** The table fixes the row and key types, so the reconciler receives `*App` and `Apps.Get(ctx, db, 42)` doesn't compile when the key is a UUID.
+- **Jobs carry a pointer, not data.** A job holds only the kind and the key, and the row is reloaded before every reconcile. The one exception is a delete, which carries the deleted row.
+- **One leader, elected in Postgres.** Replicas compete for a session-level advisory lock. The leader holds one pooled connection, and if that connection drops, the lease is gone. On a clean handoff the old leader drains its in-flight reconciles before it releases the lock. If its connection drops instead, Postgres frees the lock at once while the old leader is still draining. Add `WithObjectLocks()` to rule out overlap even then. You don't need Kubernetes, etcd or ZooKeeper.
+- **Jobs live in River's tables.** `Open` creates and upgrades them. To run migrations as a separate step, call `eddy.Migrate(ctx, pool)` there and pass `eddy.WithoutMigrate()` to `Open`.
 
-## Recording every attempt
+## Without a table
 
-Status fields cover what the reconciler decides to record. `Record` is for bookkeeping around it: it runs after every attempt, success or failure, with the error, attempt number and duration. `ColumnStatus` writes the common columns:
+Under the table layer is a smaller core for objects that aren't one row of one table. Declare a kind, enqueue it yourself, and load what you need in the handler:
 
 ```go
-eddy.New(ctx, pool,
-    eddy.Reconcile(Apps, reconcileApp),
-    eddy.Record(Apps.Kind(), eddy.ColumnStatus[uuid.UUID](pool, eddy.StatusColumns{
-        Table:        "apps",
-        Error:        "reconcile_error", // message on failure, NULL on success
-        ReconciledAt: "reconciled_at",   // now() on success
-        AttemptedAt:  "attempted_at",    // now() on every attempt
+var Clusters = eddy.NewKind[uuid.UUID]("cluster")   // any JSON-encodable ID
+
+db.InTx(ctx, func(tx *eddy.Tx) error {
+    // ... your own SQL on tx ...
+    return tx.Enqueue(ctx, Clusters.Of(clusterID))
+})
+
+db.Run(ctx,
+    eddy.Handle(Clusters, func(ctx context.Context, id uuid.UUID) error { ... }),
+    eddy.Resync(Clusters, 10*time.Minute, listClusterIDs),
+    eddy.Record(Clusters, eddy.ColumnStatus[uuid.UUID](db, eddy.StatusColumns{
+        Table: "clusters", Error: "reconcile_error", ReconciledAt: "reconciled_at",
     })),
 )
 ```
 
-For anything else, such as a separate status table, a `phase` enum or events, pass your own `func(ctx, id, eddy.Outcome) error`. `Outcome` carries `Err`, `Result`, `Attempt`, `Duration` and `Final`. `Final` is true when no retry follows, which makes it the moment to mark a row `failed`. Record errors are logged and never fail the reconcile.
+`Record` runs after every attempt with an `Outcome` (error, attempt number, duration, whether a retry follows). `ColumnStatus` writes the usual columns; pass your own function for anything else.
 
 ## Metrics and tracing
 
-Middleware wraps every reconcile of every kind. eddy itself depends on neither OpenTelemetry nor Prometheus:
+Middleware wraps every reconcile and teardown. eddy itself depends on neither OpenTelemetry nor Prometheus:
 
 ```go
 func tracing(next eddy.Handler) eddy.Handler {
-    return func(ctx context.Context, ref eddy.Ref) (eddy.Result, error) {
+    return func(ctx context.Context, ref eddy.Ref) error {
         ctx, span := tracer.Start(ctx, "reconcile "+ref.Kind(), trace.WithAttributes(
             attribute.String("eddy.id", ref.ID()),
             attribute.Int("eddy.attempt", eddy.Attempt(ctx)),
+            attribute.Bool("eddy.teardown", ref.Deleted()),
         ))
         defer span.End()
-        res, err := next(ctx, ref)
-        if err != nil {
+        err := next(ctx, ref)
+        if _, retry := eddy.RetryDelay(err); err != nil && !retry {
             span.RecordError(err)
         }
-        return res, err
+        return err
     }
 }
 
-func metrics(next eddy.Handler) eddy.Handler {
-    return func(ctx context.Context, ref eddy.Ref) (eddy.Result, error) {
-        start := time.Now()
-        res, err := next(ctx, ref)
-        reconcileSeconds.WithLabelValues(ref.Kind(), strconv.FormatBool(err == nil)).
-            Observe(time.Since(start).Seconds())
-        return res, err
-    }
-}
-
-eddy.New(ctx, pool, ...,
+db.Run(ctx, ...,
     eddy.WithMiddleware(tracing, metrics), // first is outermost
     eddy.OnLeadershipChange(func(leading bool) { isLeader.Store(leading) }),
 )
 ```
 
+`db.Leading()` reports leadership, for a readiness probe.
+
 ## Already running River?
 
-`Embed` hands eddy's workers to your River client instead of starting its own:
+`Embed` hands eddy's workers to your River client instead of `Run` starting its own:
 
 ```go
-ed, _ := eddy.Embed(pool,
-    eddy.Reconcile(Apps, reconcileApp),
-    eddy.ResyncAll(Apps, 10*time.Minute),
-)
+ed, _ := eddy.Embed(pool, eddy.Reconcile(Apps, reconcileApp))
 
 workers := river.NewWorkers()
 ed.AddWorkers(workers)
@@ -241,32 +215,33 @@ client, _ := river.NewClient(riverpgxv5.New(pool), &river.Config{
     PeriodicJobs: ed.PeriodicJobs(),
 })
 
-enq, _ := eddy.EnqueuerFor(client)
-db := eddy.Wrap(pool, enq)         // same eddy.DB as before
+db := ed.DB(client)                // the same eddy.DB, enqueueing through your client
 ```
 
-eddy doesn't elect a leader in this mode. Every process whose client lists `ed.Queue()` works it. List the queue on one process only, or add `WithObjectLocks()` so processes never overlap on an object. Resync jobs run on River's own elected leader.
+An API-only process uses `eddy.Attach(pool, client)` to get the `DB`. eddy doesn't elect a leader in this mode: every process whose client lists `ed.Queue()` works it. List the queue on one process only, or add `WithObjectLocks()` so processes never overlap on a row. Resync jobs run on River's own elected leader, and you run River's migrations.
 
 ## Options
 
 | Option | Default | |
 |---|---|---|
-| `Reconcile(table, f)` | — | Register a reconciler for a table's rows |
-| `ResyncAll(table, every)` | off | Periodically enqueue every row of a table |
-| `Handle(kind, r)` / `HandleFunc(kind, f)` | — | Register a reconciler for a bare kind |
-| `Resync(kind, every, list)` | off | Periodically enqueue the listed objects of a kind |
+| `Reconcile(table, f)` | — | Reconcile a table's rows |
+| `Teardown(table, f)` | — | Tear down a table's deleted rows |
+| `WithResync(every)` | 10m | How often every row is re-checked; 0 turns it off |
+| `Handle(kind, f)` | — | Reconcile a bare kind |
+| `Resync(kind, every, list)` | off | Periodically enqueue the listed objects of a bare kind |
+| `Record(kind, f)` | off | Record each attempt of a bare kind (see `ColumnStatus`) |
 | `WithWorkers(n)` | 10 | Concurrent reconciles on the leader |
-| `WithQueue(name)` | `eddy` | River queue; API and controller must match |
-| `WithElector(e)` | `AdvisoryLock(pool, queue)` | Leader election; `Solo()` for a single replica |
-| `WithReconcileTimeout(d)` | 1m | Bound on one `Reconcile` call |
-| `WithShutdownTimeout(d)` | 30s | Drain time on stop or lost leadership |
+| `WithElector(e)` | advisory lock | Leader election; `Solo()` for a single replica |
 | `WithObjectLocks()` | off | Per-object advisory lock across processes; holds one pool connection per running reconcile |
-| `Record(kind, f)` | off | Write each attempt's outcome back (see `ColumnStatus`) |
+| `WithReconcileTimeout(d)` | 1m | Bound on one reconcile |
+| `WithShutdownTimeout(d)` | 30s | Drain time on stop or lost leadership |
 | `WithMiddleware(m...)` | — | Wrap every reconcile (metrics, tracing, logging) |
-| `OnLeadershipChange(f)` | — | Called on gaining/losing leadership (`Controller` only) |
+| `OnLeadershipChange(f)` | — | Called on gaining or losing leadership |
+| `WithQueue(name)` | `eddy` | River queue; set it on `Open` |
+| `WithoutMigrate()` | — | Don't create River's tables in `Open` |
 | `WithLogger(l)` | `slog.Default()` | |
 
-`Controller.Leading()` reports leadership, for a readiness probe or metrics.
+Options can go to `Open` or to `Run`; those given to `Open` apply to every `Run` on that `DB`.
 
 ## Development
 

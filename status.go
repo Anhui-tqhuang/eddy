@@ -7,16 +7,16 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // Outcome describes one finished reconcile attempt, for Record.
 type Outcome struct {
-	// Err is the reconciler's error; nil on success.
+	// Err is the reconciler's error; nil on success and on a Retry.
 	Err error
-	// Result is what the reconciler returned on success.
-	Result Result
+	// RetryAfter is positive when the reconciler asked for a Retry: it is
+	// not done, but has not failed either.
+	RetryAfter time.Duration
 	// Attempt is 1 for the first try.
 	Attempt int
 	// Final is true when no retry follows: success, a Permanent error, or
@@ -26,13 +26,15 @@ type Outcome struct {
 	Duration time.Duration
 }
 
-// OK reports whether the reconcile succeeded.
-func (o Outcome) OK() bool { return o.Err == nil }
+// OK reports whether the reconcile finished without error and without
+// asking for a Retry.
+func (o Outcome) OK() bool { return o.Err == nil && o.RetryAfter == 0 }
 
 // Record calls f after every reconcile attempt of kind k, success or
-// failure, so the outcome can be written back to the object's row, where the
-// API can show it. A failing f is logged and does not fail the reconcile.
-// ColumnStatus builds an f for the common case.
+// failure, so the outcome can be written back where the API can show it. A
+// failing f is logged and does not fail the reconcile. ColumnStatus builds
+// an f for the common case. It is for kinds registered with Handle; a Table
+// records the same through its "error" and "reconciled" fields.
 func Record[ID any](k Kind[ID], f func(ctx context.Context, id ID, o Outcome) error) Option {
 	return func(c *config) error {
 		if k.name == "" {
@@ -101,6 +103,8 @@ func ColumnStatus[ID any](db Execer, cols StatusColumns) func(ctx context.Contex
 	return func(ctx context.Context, id ID, o Outcome) error {
 		var err error
 		switch {
+		case o.RetryAfter > 0:
+			// Still converging: neither a success nor a failure to record.
 		case o.OK() && okSQL != "":
 			_, err = db.Exec(ctx, okSQL, id)
 		case !o.OK() && failSQL != "":
@@ -120,7 +124,7 @@ func ColumnStatus[ID any](db Execer, cols StatusColumns) func(ctx context.Contex
 // statements builds the success and failure UPDATEs; either is empty when it
 // would set nothing.
 func (c StatusColumns) statements() (ok, fail string) {
-	q := func(name string) string { return pgx.Identifier(strings.Split(name, ".")).Sanitize() }
+	q := quote
 	var okSet, failSet []string
 	if c.Error != "" {
 		okSet = append(okSet, q(c.Error)+" = NULL")

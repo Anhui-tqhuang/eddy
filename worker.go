@@ -2,7 +2,6 @@ package eddy
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"time"
 
@@ -11,21 +10,23 @@ import (
 	"github.com/riverqueue/river"
 )
 
-// ErrUnknownKind is returned (and retried) for a job whose kind has no
-// handler, so jobs enqueued ahead of a rollout are not lost.
-var ErrUnknownKind = errors.New("eddy: no reconciler registered for kind")
-
-// runtime is what the workers share: config, object locks and the
-// middleware-wrapped handler.
+// runtime is what the workers share: config, the merged handlers, object
+// locks and the middleware-wrapped handler.
 type runtime struct {
-	cfg   *config
-	pool  *pgxpool.Pool
-	locks objectLocker
-	chain Handler
+	cfg      *config
+	pool     *pgxpool.Pool
+	handlers map[string]handler
+	resyncs  map[string]resync
+	locks    objectLocker
+	chain    Handler
 }
 
-func newRuntime(cfg *config, pool *pgxpool.Pool) *runtime {
-	rt := &runtime{cfg: cfg, pool: pool}
+func newRuntime(cfg *config, pool *pgxpool.Pool) (*runtime, error) {
+	handlers, resyncs, err := cfg.plan()
+	if err != nil {
+		return nil, err
+	}
+	rt := &runtime{cfg: cfg, pool: pool, handlers: handlers, resyncs: resyncs}
 	if cfg.objectLocks {
 		rt.locks = &advisoryLocks{pool: pool, local: newProcessLocks()}
 	} else {
@@ -36,34 +37,36 @@ func newRuntime(cfg *config, pool *pgxpool.Pool) *runtime {
 		h = cfg.middleware[i](h)
 	}
 	rt.chain = h
-	return rt
+	return rt, nil
 }
+
+type jobKey struct{}
 
 // reconcile is the innermost handler: it runs the kind's reconciler and
 // records the outcome.
-func (rt *runtime) reconcile(ctx context.Context, ref Ref) (Result, error) {
-	h, ok := rt.cfg.handlers[ref.kind]
+func (rt *runtime) reconcile(ctx context.Context, ref Ref) error {
+	h, ok := rt.handlers[ref.kind]
 	if !ok {
-		return Done, fmt.Errorf("%w %q", ErrUnknownKind, ref.kind)
+		return fmt.Errorf("%w %q", ErrUnknownKind, ref.kind)
 	}
+	job, _ := ctx.Value(jobKey{}).(*river.Job[reconcileJob])
 	start := time.Now()
-	res, err := h(ctx, rt.pool, ref.id)
-	rt.record(ctx, ref, res, err, time.Since(start))
-	return res, err
+	err := h(ctx, rt.pool, job.Args)
+	rt.record(ctx, ref, job, err, time.Since(start))
+	return err
 }
 
-func (rt *runtime) record(ctx context.Context, ref Ref, res Result, err error, took time.Duration) {
+func (rt *runtime) record(ctx context.Context, ref Ref, job *river.Job[reconcileJob], err error, took time.Duration) {
 	rec, ok := rt.cfg.recorders[ref.kind]
 	if !ok {
 		return
 	}
-	attempt := Attempt(ctx)
-	o := Outcome{
-		Err:      err,
-		Result:   res,
-		Attempt:  attempt,
-		Final:    err == nil || IsPermanent(err) || attempt >= maxAttempts(ctx),
-		Duration: took,
+	o := Outcome{Attempt: job.Attempt, Duration: took}
+	if after, retry := RetryDelay(err); retry && !IsPermanent(err) {
+		o.RetryAfter = after
+	} else {
+		o.Err = err
+		o.Final = err == nil || IsPermanent(err) || job.Attempt >= job.MaxAttempts
 	}
 	// Record even when the reconcile timed out or was cancelled.
 	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
@@ -71,16 +74,6 @@ func (rt *runtime) record(ctx context.Context, ref Ref, res Result, err error, t
 	if rerr := rec(rctx, ref.id, o); rerr != nil {
 		rt.cfg.logger.WarnContext(ctx, "eddy: record status failed", "ref", ref.String(), "error", rerr)
 	}
-}
-
-type maxAttemptsKey struct{}
-
-func maxAttempts(ctx context.Context) int {
-	n, ok := ctx.Value(maxAttemptsKey{}).(int)
-	if !ok {
-		return river.MaxAttemptsDefault
-	}
-	return n
 }
 
 // reconcileWorker is the River worker for reconcile jobs.
@@ -95,7 +88,6 @@ func (w *reconcileWorker) Timeout(*river.Job[reconcileJob]) time.Duration {
 
 func (w *reconcileWorker) Work(ctx context.Context, job *river.Job[reconcileJob]) error {
 	ref := job.Args.ref()
-	log := w.rt.cfg.logger
 
 	release, busy, err := w.rt.locks.acquire(ctx, ref)
 	if err != nil {
@@ -105,28 +97,22 @@ func (w *reconcileWorker) Work(ctx context.Context, job *river.Job[reconcileJob]
 		return river.JobSnooze(busyRetry)
 	}
 	ctx = withAttempt(ctx, job.Attempt)
-	ctx = context.WithValue(ctx, maxAttemptsKey{}, job.MaxAttempts)
-	res, err := w.rt.chain(ctx, ref)
+	ctx = context.WithValue(ctx, jobKey{}, job)
+	err = w.rt.chain(ctx, ref)
 	release()
 
-	if err != nil {
-		log.WarnContext(ctx, "eddy: reconcile failed", "ref", ref.String(), "attempt", job.Attempt, "error", err)
-		if IsPermanent(err) {
-			return river.JobCancel(err)
-		}
-		return fmt.Errorf("reconcile %s: %w", ref, err)
+	if err == nil {
+		return nil
 	}
-	if res.RequeueAfter > 0 {
-		client := river.ClientFromContext[pgx.Tx](ctx)
-		_, err := client.Insert(ctx, job.Args, &river.InsertOpts{
-			Queue:       w.rt.cfg.queue,
-			ScheduledAt: time.Now().Add(res.RequeueAfter),
-		})
-		if err != nil {
-			return fmt.Errorf("requeue %s: %w", ref, err)
-		}
+	if IsPermanent(err) {
+		w.rt.cfg.logger.WarnContext(ctx, "eddy: reconcile failed for good", "ref", ref.String(), "error", err)
+		return river.JobCancel(err)
 	}
-	return nil
+	if after, retry := RetryDelay(err); retry {
+		return river.JobSnooze(after)
+	}
+	w.rt.cfg.logger.WarnContext(ctx, "eddy: reconcile failed", "ref", ref.String(), "attempt", job.Attempt, "error", err)
+	return fmt.Errorf("reconcile %s: %w", ref, err)
 }
 
 // resyncWorker enqueues every object of one kind.
@@ -136,30 +122,30 @@ type resyncWorker struct {
 }
 
 func (w *resyncWorker) Work(ctx context.Context, job *river.Job[resyncJob]) error {
-	cfg := w.rt.cfg
-	rs, ok := cfg.resyncs[job.Args.Object]
+	kind := job.Args.Object
+	rs, ok := w.rt.resyncs[kind]
 	if !ok {
-		return river.JobCancel(fmt.Errorf("%w %q", ErrUnknownKind, job.Args.Object))
+		return river.JobCancel(fmt.Errorf("%w %q", ErrUnknownKind, kind))
 	}
 	ids, err := rs.list(ctx, w.rt.pool)
 	if err != nil {
-		return fmt.Errorf("resync %s: list: %w", job.Args.Object, err)
+		return fmt.Errorf("resync %s: list: %w", kind, err)
 	}
 	client := river.ClientFromContext[pgx.Tx](ctx)
-	for start := 0; start < len(ids); start += defaultResyncBatch {
-		end := min(start+defaultResyncBatch, len(ids))
-		params := make([]river.InsertManyParams, 0, end-start)
-		for _, id := range ids[start:end] {
-			params = append(params, river.InsertManyParams{
-				Args:       reconcileJob{Object: job.Args.Object, ID: id},
-				InsertOpts: &river.InsertOpts{Queue: cfg.queue},
-			})
+	for start := 0; start < len(ids); start += insertBatch {
+		batch := ids[start:min(start+insertBatch, len(ids))]
+		params := make([]river.InsertManyParams, len(batch))
+		for i, id := range batch {
+			params[i] = river.InsertManyParams{
+				Args:       reconcileJob{Object: kind, ID: id},
+				InsertOpts: &river.InsertOpts{Queue: w.rt.cfg.queue},
+			}
 		}
 		if _, err := client.InsertMany(ctx, params); err != nil {
-			return fmt.Errorf("resync %s: enqueue: %w", job.Args.Object, err)
+			return fmt.Errorf("resync %s: enqueue: %w", kind, err)
 		}
 	}
-	cfg.logger.DebugContext(ctx, "eddy: resync enqueued", "kind", job.Args.Object, "count", len(ids))
+	w.rt.cfg.logger.DebugContext(ctx, "eddy: resync enqueued", "kind", kind, "count", len(ids))
 	return nil
 }
 
@@ -169,10 +155,10 @@ func (rt *runtime) addWorkers(ws *river.Workers) {
 	river.AddWorker(ws, &resyncWorker{rt: rt})
 }
 
-// periodicJobs returns one resync job per Resync option.
+// periodicJobs returns one resync job per resynced kind.
 func (rt *runtime) periodicJobs() []*river.PeriodicJob {
-	jobs := make([]*river.PeriodicJob, 0, len(rt.cfg.resyncs))
-	for kind, rs := range rt.cfg.resyncs {
+	jobs := make([]*river.PeriodicJob, 0, len(rt.resyncs))
+	for kind, rs := range rt.resyncs {
 		jobs = append(jobs, river.NewPeriodicJob(
 			river.PeriodicInterval(rs.every),
 			func() (river.JobArgs, *river.InsertOpts) {

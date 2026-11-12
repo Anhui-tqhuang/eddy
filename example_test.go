@@ -3,7 +3,6 @@ package eddy_test
 import (
 	"context"
 	"log"
-	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -13,13 +12,13 @@ import (
 
 // Service is one row of the services table.
 type Service struct {
-	ID    uuid.UUID `db:"id,default"`
-	Image string    `db:"image"`
-	Phase string    `db:"phase,status"` // written only by the controller
+	ID    uuid.UUID `db:",default"`
+	Image string
+	Phase string `db:",status"` // written only by the controller
 }
 
 // Services is shared by the API and the controller.
-var Services = eddy.NewTable[Service, uuid.UUID]("services")
+var Services = eddy.NewTable[Service]("services")
 
 func Example() {
 	ctx := context.Background()
@@ -27,31 +26,30 @@ func Example() {
 	if err != nil {
 		log.Fatal(err)
 	}
-
-	// Controller process: reconcile services, one replica at a time.
-	ctl, err := eddy.New(ctx, pool,
-		eddy.Reconcile(Services, func(ctx context.Context, id uuid.UUID, svc *Service) (eddy.Result, error) {
-			if svc == nil {
-				return eddy.Done, nil // row deleted: tear down what id stood for
-			}
-			// Converge the outside world, then record the result.
-			svc.Phase = "ready"
-			return eddy.Done, nil
-		}),
-		eddy.ResyncAll(Services, 10*time.Minute),
-	)
-	if err != nil {
-		log.Fatal(err)
-	}
-	go func() { _ = ctl.Run(ctx) }()
-
-	// API process: the write enqueues the reconcile itself.
 	db, err := eddy.Open(ctx, pool)
 	if err != nil {
 		log.Fatal(err)
 	}
+
+	// API: the write enqueues the reconcile itself.
 	svc := Service{Image: "web:1"}
 	if err := Services.Insert(ctx, db, &svc); err != nil {
+		log.Fatal(err)
+	}
+
+	// Controller: run on any number of replicas; one leads.
+	err = db.Run(ctx,
+		eddy.Reconcile(Services, func(ctx context.Context, svc *Service) error {
+			// Converge the outside world, then record the result.
+			svc.Phase = "ready"
+			return nil
+		}),
+		eddy.Teardown(Services, func(ctx context.Context, svc *Service) error {
+			// svc is the row as it was when deleted.
+			return nil
+		}),
+	)
+	if err != nil {
 		log.Fatal(err)
 	}
 }

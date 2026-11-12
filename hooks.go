@@ -6,20 +6,23 @@ import (
 )
 
 // Handler reconciles the object ref points at. Middleware wraps it.
-type Handler func(ctx context.Context, ref Ref) (Result, error)
+type Handler func(ctx context.Context, ref Ref) error
 
 // Middleware wraps every reconcile, for every kind: the place for metrics,
 // tracing, logging or panic recovery. The first middleware given is the
 // outermost. Attempt(ctx) reports the attempt number inside it.
 //
 //	func timing(next eddy.Handler) eddy.Handler {
-//		return func(ctx context.Context, ref eddy.Ref) (eddy.Result, error) {
+//		return func(ctx context.Context, ref eddy.Ref) error {
 //			start := time.Now()
-//			res, err := next(ctx, ref)
+//			err := next(ctx, ref)
 //			observe(ref.Kind(), time.Since(start), err)
-//			return res, err
+//			return err
 //		}
 //	}
+//
+// An error for which RetryDelay reports true is a requested retry, not a
+// failure.
 type Middleware func(next Handler) Handler
 
 // WithMiddleware appends middleware around every reconcile.
@@ -36,7 +39,7 @@ func WithMiddleware(m ...Middleware) Option {
 }
 
 // OnLeadershipChange calls f with true when this replica starts leading and
-// with false when it stops. f must not block. It applies to Controller only;
+// with false when it stops. f must not block. It applies to DB.Run only;
 // with Embed, leadership is River's.
 func OnLeadershipChange(f func(leading bool)) Option {
 	return func(c *config) error {

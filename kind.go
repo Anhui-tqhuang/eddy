@@ -6,8 +6,9 @@ import (
 )
 
 // Kind names a type of object that eddy reconciles, together with the Go type
-// of its identifier. Declare one per resource type and share it between the
-// API (which enqueues) and the controller (which handles):
+// of its identifier. It is the layer under Table, for objects that are not
+// one row of one table. Declare one per resource type and share it between
+// the API (which enqueues) and the controller (which handles):
 //
 //	var Apps = eddy.NewKind[uuid.UUID]("app")
 //
@@ -43,8 +44,9 @@ func (k Kind[ID]) Of(id ID) Ref {
 // Ref points at one object: a kind name and an encoded identifier. Build one
 // with Kind.Of. The zero Ref is invalid.
 type Ref struct {
-	kind string
-	id   json.RawMessage
+	kind    string
+	id      json.RawMessage
+	deleted bool
 }
 
 // Kind returns the referenced object's kind name.
@@ -53,6 +55,10 @@ func (r Ref) Kind() string { return r.kind }
 // ID returns the object's identifier as JSON text, e.g. 42 or "acme", for
 // logs, metrics labels and span attributes.
 func (r Ref) ID() string { return string(r.id) }
+
+// Deleted reports whether the reference is to a deleted table row, whose
+// reconcile is a teardown. It is set only on the Ref middleware receives.
+func (r Ref) Deleted() bool { return r.deleted }
 
 // String formats the reference as kind/id, for logs.
 func (r Ref) String() string { return r.kind + "/" + string(r.id) }

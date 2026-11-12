@@ -9,10 +9,10 @@ import (
 )
 
 // Embedded plugs eddy into a River client you already run, instead of
-// eddy running its own (see New). Register its workers, queue and periodic
-// jobs on your client:
+// DB.Run starting its own. Register its workers, queue and periodic jobs on
+// your client, then get the DB from it:
 //
-//	ed, _ := eddy.Embed(pool, eddy.HandleFunc(Apps, reconcileApp))
+//	ed, _ := eddy.Embed(pool, eddy.Reconcile(Apps, reconcileApp))
 //
 //	workers := river.NewWorkers()
 //	ed.AddWorkers(workers)
@@ -22,7 +22,7 @@ import (
 //		Workers:      workers,
 //		PeriodicJobs: ed.PeriodicJobs(),
 //	})
-//	api, _ := eddy.EnqueuerFor(client)
+//	db := ed.DB(client)
 //
 // There is no eddy leader election here: every process that lists the eddy
 // queue works it. Reconciles of one object are serialised within a process;
@@ -32,26 +32,22 @@ type Embedded struct {
 	rt *runtime
 }
 
-// Embed returns eddy's workers for use with your own River client. pool is
-// used by table reconcilers (Reconcile, ResyncAll) and WithObjectLocks, and
-// may be nil without them. WithElector,
-// OnLeadershipChange and WithShutdownTimeout do not apply: your client owns
-// its lifecycle.
+// Embed returns eddy's workers for use with your own River client.
+// WithElector, OnLeadershipChange, WithShutdownTimeout and WithoutMigrate do
+// not apply: your client owns its lifecycle and you run River's migrations.
 func Embed(pool *pgxpool.Pool, opts ...Option) (*Embedded, error) {
+	if pool == nil {
+		return nil, errors.New("eddy: Embed: nil pool")
+	}
 	cfg, err := newConfig(opts)
 	if err != nil {
 		return nil, err
 	}
-	if err := cfg.validateWorkers(); err != nil {
+	rt, err := newRuntime(cfg, pool)
+	if err != nil {
 		return nil, err
 	}
-	if cfg.objectLocks && pool == nil {
-		return nil, errors.New("eddy: Embed: WithObjectLocks needs a pool")
-	}
-	if cfg.needsPool && pool == nil {
-		return nil, errors.New("eddy: Embed: table reconcilers need a pool")
-	}
-	return &Embedded{rt: newRuntime(cfg, pool)}, nil
+	return &Embedded{rt: rt}, nil
 }
 
 // AddWorkers registers eddy's workers on ws.
@@ -65,18 +61,10 @@ func (e *Embedded) QueueConfig() river.QueueConfig {
 	return river.QueueConfig{MaxWorkers: e.rt.cfg.workers}
 }
 
-// PeriodicJobs are the Resync jobs; add them to your client's PeriodicJobs.
+// PeriodicJobs are the resync jobs; add them to your client's PeriodicJobs.
 func (e *Embedded) PeriodicJobs() []*river.PeriodicJob { return e.rt.periodicJobs() }
 
-// EnqueuerFor returns an Enqueuer that inserts through your River client.
-// Only WithQueue and WithLogger apply; WithQueue must match the controller.
-func EnqueuerFor(client *river.Client[pgx.Tx], opts ...Option) (*Enqueuer, error) {
-	if client == nil {
-		return nil, errors.New("eddy: EnqueuerFor: nil client")
-	}
-	cfg, err := newConfig(opts)
-	if err != nil {
-		return nil, err
-	}
-	return &Enqueuer{river: client, queue: cfg.queue}, nil
+// DB returns the DB that enqueues through client.
+func (e *Embedded) DB(client *river.Client[pgx.Tx]) *DB {
+	return &DB{pool: e.rt.pool, river: client, cfg: e.rt.cfg}
 }

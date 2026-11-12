@@ -14,6 +14,17 @@ An eddy is a current that curls back on itself inside a river. eddy is the recon
 
 Your API owns plain Postgres rows: the desired state. eddy turns those rows into real resources somewhere else, such as cloud resources, Kubernetes objects, DNS records or third-party SaaS state, and keeps them converged. It's the controller pattern without a Kubernetes API server. Postgres stores the state, carries the queue and elects the leader.
 
+## Languages
+
+eddy is available for Go and Python. Each has its own usage documentation.
+
+| Language | Package | Documentation |
+|---|---|---|
+| Go | `github.com/Anhui-tqhuang/eddy` | This README |
+| Python | [`eddy-pg`](https://github.com/Anhui-tqhuang/eddy-python) | [eddy-python README](https://github.com/Anhui-tqhuang/eddy-python#readme) |
+
+The two store jobs in the same format and share the leader lock, so they can be mixed on one database: a Python API can feed a Go controller, or the reverse. The rest of this page covers Go.
+
 ## Install
 
 ```sh
@@ -288,4 +299,4 @@ make test-db   # plus integration tests against Postgres
 
 ## License
 
-MIT
+MIT. eddy is built on River, which is licensed under MPL-2.0.

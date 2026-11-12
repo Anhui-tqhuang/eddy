@@ -297,6 +297,18 @@ make test-db   # plus integration tests against Postgres
                # (TEST_DB_URL=postgres://localhost:5432/eddy_test?sslmode=disable)
 ```
 
+## River version
+
+eddy is built on River **v0.51.2**, pinned in `go.mod` here and in the `eddyotel` and `eddyprom` modules.
+
+> **Keep this repository and [eddy-python](https://github.com/Anhui-tqhuang/eddy-python) on the same River version.** The two libraries share River's tables, so they must agree on the table layout.
+
+When upgrading River:
+
+1. Update `go.mod` in this repository and in `eddyotel` and `eddyprom`, then run `make test-db`.
+2. Upgrade eddy-python in the same change window. It bundles River's migration files and works the job table with its own SQL, so it may need code changes as well as new files; see "River version" in its README.
+3. Change the version stated in this section.
+
 ## License
 
 MIT. eddy is built on River, which is licensed under MPL-2.0.

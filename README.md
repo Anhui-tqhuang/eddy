@@ -129,6 +129,37 @@ type App struct {
 }
 ```
 
+## Soft delete
+
+eddy has no soft-delete setting. A soft delete is an ordinary update that the reconciler acts on. Use it when the row should stay visible while its resources are torn down, or when a failed teardown should show in the row's status columns.
+
+```go
+type App struct {
+    ...
+    DeletedAt *time.Time             // set by the API; an ordinary column
+}
+
+// API: mark the row. Its reconcile is enqueued like any other write.
+Apps.Exec(ctx, db, "UPDATE apps SET deleted_at = now() WHERE id = $1", id)
+
+// Controller: tear down, then remove the row.
+eddy.Reconcile(Apps, func(ctx context.Context, app *App) error {
+    if app.DeletedAt != nil {
+        if err := undeploy(ctx, app); err != nil {
+            return err               // retried; the row and its error stay visible
+        }
+        _, err := db.Exec(ctx, "DELETE FROM apps WHERE id = $1", app.ID)
+        return err
+    }
+    ...
+})
+```
+
+- **Remove the row with plain `db.Exec`.** It enqueues nothing, so the table needs no `Teardown`. `Apps.Delete` would enqueue a teardown for work that is already done.
+- **The teardown branch must be idempotent.** Until the row is removed, the resync keeps reconciling it.
+- **To keep the row for good,** skip the final `DELETE`, record that teardown finished in a status field, and return early when it is set.
+- **Filter your own reads.** `Get` and `Select` return soft-deleted rows; add `deleted_at IS NULL` where the API should hide them.
+
 ## Field tags
 
 | Tag | Meaning |

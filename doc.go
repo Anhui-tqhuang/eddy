@@ -9,6 +9,10 @@
 // the function registered with Reconcile, and saves the status fields that
 // function set; deleted rows go to the function registered with Teardown.
 //
+// An object has at most one waiting reconcile job: a write or a resync uses the one that
+// waits (writes bring it forward), and a Retry gives way to a job that already waits. A
+// write while the object's reconcile runs still enqueues one more.
+//
 // Kind and Handle are the smaller core underneath, for objects that are not
 // one row of one table.
 package eddy

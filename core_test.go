@@ -241,11 +241,22 @@ func TestHandle_sameObjectEnqueuedTwice_neverOverlaps(t *testing.T) {
 	apps := eddy.NewKind[int64]("app")
 	var got seenLog[int64]
 	var inFlight, maxInFlight atomic.Int32
+	// Enqueued three times while waiting, the object has one job (merged).
 	if err := db.Enqueue(ctx, apps.Of(1), apps.Of(1), apps.Of(1)); err != nil {
 		t.Fatal(err)
 	}
-	run(t, db, eddy.Handle(apps, func(_ context.Context, id int64) error {
+	if n := jobCount(t, db, "kind = 'eddy.reconcile'"); n != 1 {
+		t.Fatalf("jobs = %d, want 1", n)
+	}
+	// A write while the object's reconcile runs adds a job: each run enqueues the object again,
+	// so jobs for it pile up while one runs; they must still never overlap.
+	run(t, db, eddy.Handle(apps, func(ctx context.Context, id int64) error {
 		maxInFlight.Store(max(maxInFlight.Load(), inFlight.Add(1)))
+		if got.n() < 2 {
+			if err := db.Enqueue(ctx, apps.Of(1)); err != nil {
+				return err
+			}
+		}
 		time.Sleep(100 * time.Millisecond)
 		inFlight.Add(-1)
 		got.add(id)

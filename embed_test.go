@@ -87,8 +87,14 @@ func TestObjectLocks_twoProcesses_neverOverlap(t *testing.T) {
 	kind := eddy.NewKind[int64]("app")
 	var done seenLog[int64]
 	var inFlight, maxInFlight atomic.Int32
-	reconcile := func(_ context.Context, id int64) error {
+	var db *eddy.DB
+	reconcile := func(ctx context.Context, id int64) error {
 		n := inFlight.Add(1)
+		if done.n() < 3 {
+			if err := db.Enqueue(ctx, kind.Of(9)); err != nil {
+				return err
+			}
+		}
 		for {
 			m := maxInFlight.Load()
 			if n <= m || maxInFlight.CompareAndSwap(m, n) {
@@ -100,7 +106,6 @@ func TestObjectLocks_twoProcesses_neverOverlap(t *testing.T) {
 		done.add(id)
 		return nil
 	}
-	var db *eddy.DB
 	for range 2 {
 		ed, err := eddy.Embed(pool, quiet, eddy.Handle(kind, reconcile), eddy.WithObjectLocks())
 		if err != nil {
@@ -108,7 +113,9 @@ func TestObjectLocks_twoProcesses_neverOverlap(t *testing.T) {
 		}
 		db = ed.DB(startRiver(t, pool, ed))
 	}
-	if err := db.Enqueue(ctx, kind.Of(9), kind.Of(9), kind.Of(9), kind.Of(9)); err != nil {
+	// One job at first; each run enqueues the object again (a write during the run adds a
+	// job), so a second process may pick that job up while the first still runs.
+	if err := db.Enqueue(ctx, kind.Of(9)); err != nil {
 		t.Fatal(err)
 	}
 	waitUntil(t, func() bool { return done.n() == 4 })

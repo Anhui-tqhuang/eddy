@@ -141,13 +141,34 @@ func (db *DB) within(ctx context.Context, fn func(tx pgx.Tx, db *DB) error) erro
 
 // insert enqueues jobs, inside tx when it is not nil.
 func (db *DB) insert(ctx context.Context, tx pgx.Tx, jobs []reconcileJob) error {
+	jobs = withoutDuplicates(jobs)
+	var q querier = db.pool
+	if tx != nil {
+		q = tx
+	}
 	for start := 0; start < len(jobs); start += insertBatch {
 		batch := jobs[start:min(start+insertBatch, len(jobs))]
-		params := make([]river.InsertManyParams, len(batch))
-		for i, j := range batch {
-			params[i] = river.InsertManyParams{Args: j, InsertOpts: j.insertOpts(db.cfg.queue)}
+		// An object with a waiting job gets no second one (see merge.go): its job is
+		// brought forward when it waits for later.
+		waiting, err := waitingJobs(ctx, q, batch, 0)
+		if err != nil {
+			return err
 		}
-		var err error
+		params := make([]river.InsertManyParams, 0, len(batch))
+		for i, j := range batch {
+			w, ok := waiting[i]
+			switch {
+			case !ok:
+				params = append(params, river.InsertManyParams{Args: j, InsertOpts: j.insertOpts(db.cfg.queue)})
+			case w.later:
+				if err := db.bringForward(ctx, tx, w.id); err != nil {
+					return err
+				}
+			}
+		}
+		if len(params) == 0 {
+			continue
+		}
 		if tx != nil {
 			_, err = db.river.InsertManyTx(ctx, tx, params)
 		} else {
@@ -156,6 +177,20 @@ func (db *DB) insert(ctx context.Context, tx pgx.Tx, jobs []reconcileJob) error 
 		if err != nil {
 			return fmt.Errorf("eddy: enqueue: %w", err)
 		}
+	}
+	return nil
+}
+
+// bringForward makes a waiting job runnable now.
+func (db *DB) bringForward(ctx context.Context, tx pgx.Tx, id int64) error {
+	var err error
+	if tx != nil {
+		_, err = db.river.JobRetryTx(ctx, tx, id)
+	} else {
+		_, err = db.river.JobRetry(ctx, id)
+	}
+	if err != nil {
+		return fmt.Errorf("eddy: bring job %d forward: %w", id, err)
 	}
 	return nil
 }

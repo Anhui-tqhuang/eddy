@@ -48,7 +48,7 @@ func TestMaxWorkers_kindGetsItsOwnCappedQueue(t *testing.T) {
 		t.Fatal(err)
 	}
 	for where, want := range map[string]int{
-		"args->>'kind' = 'reports' AND queue = 'eddy-reports' AND priority = 3": 7,
+		"args->>'kind' = 'reports' AND queue = 'eddy-reports' AND priority = 3": 6, // report 0's second enqueue merged
 		"args->>'kind' = 'fast' AND queue = 'eddy' AND priority = 1":            1,
 		"args->>'kind' = 'bulk' AND queue = 'eddy' AND priority = 4":            1,
 	} {

@@ -109,6 +109,11 @@ func (w *reconcileWorker) Work(ctx context.Context, job *river.Job[reconcileJob]
 		return river.JobCancel(err)
 	}
 	if after, retry := RetryDelay(err); retry {
+		// Another job for this object already waits (a write during this run): it carries
+		// on, and this one finishes rather than starting a second retry loop.
+		if others, werr := waitingJobs(ctx, w.rt.pool, []reconcileJob{job.Args}, job.ID); werr == nil && len(others) > 0 {
+			return nil
+		}
 		return river.JobSnooze(after)
 	}
 	w.rt.cfg.logger.WarnContext(ctx, "eddy: reconcile failed", "ref", ref.String(), "attempt", job.Attempt, "error", err)
@@ -132,12 +137,35 @@ func (w *resyncWorker) Work(ctx context.Context, job *river.Job[resyncJob]) erro
 		return fmt.Errorf("resync %s: list: %w", kind, err)
 	}
 	client := river.ClientFromContext[pgx.Tx](ctx)
+	// One waiting job per object (see merge.go): cancel any extra ones first.
+	extra, err := extraWaitingJobs(ctx, w.rt.pool, kind)
+	if err != nil {
+		return fmt.Errorf("resync %s: %w", kind, err)
+	}
+	for _, id := range extra {
+		if _, err := client.JobCancel(ctx, id); err != nil {
+			return fmt.Errorf("resync %s: cancel extra job %d: %w", kind, id, err)
+		}
+	}
 	for start := 0; start < len(ids); start += insertBatch {
 		batch := ids[start:min(start+insertBatch, len(ids))]
-		params := make([]river.InsertManyParams, len(batch))
+		jobs := make([]reconcileJob, len(batch))
 		for i, id := range batch {
-			j := reconcileJob{Object: kind, ID: id, set: w.rt.cfg.settings[kind]}
-			params[i] = river.InsertManyParams{Args: j, InsertOpts: j.insertOpts(w.rt.cfg.queue)}
+			jobs[i] = reconcileJob{Object: kind, ID: id, set: w.rt.cfg.settings[kind]}
+		}
+		// An object whose job already waits is left alone (see merge.go).
+		waiting, err := waitingJobs(ctx, w.rt.pool, jobs, 0)
+		if err != nil {
+			return fmt.Errorf("resync %s: %w", kind, err)
+		}
+		params := make([]river.InsertManyParams, 0, len(jobs))
+		for i, j := range jobs {
+			if _, ok := waiting[i]; !ok {
+				params = append(params, river.InsertManyParams{Args: j, InsertOpts: j.insertOpts(w.rt.cfg.queue)})
+			}
+		}
+		if len(params) == 0 {
+			continue
 		}
 		if _, err := client.InsertMany(ctx, params); err != nil {
 			return fmt.Errorf("resync %s: enqueue: %w", kind, err)

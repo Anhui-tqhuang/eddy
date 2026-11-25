@@ -349,8 +349,9 @@ func TestTable_tx_rollbackDropsRowAndJob(t *testing.T) {
 	if err := tx.Commit(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if n := jobs(); n != 4 {
-		t.Fatalf("jobs after commit = %d, want 4", n)
+	// Two rows, written twice each: one job per row (merged, see merge.go).
+	if n := jobs(); n != 2 {
+		t.Fatalf("jobs after commit = %d, want 2", n)
 	}
 	// Plain SQL through the DB enqueues nothing.
 	if _, err := db.Exec(ctx, "UPDATE apps SET image = 'raw'"); err != nil {
@@ -361,8 +362,8 @@ func TestTable_tx_rollbackDropsRowAndJob(t *testing.T) {
 		t.Fatal(err)
 	}
 	rows.Close()
-	if n := jobs(); n != 4 {
-		t.Fatalf("jobs after raw Exec = %d, want 4", n)
+	if n := jobs(); n != 2 {
+		t.Fatalf("jobs after raw Exec = %d, want 2", n)
 	}
 }
 
